@@ -1,0 +1,224 @@
+
+name: Build AAAlko APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AAAlko Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Pobierz repozytorium
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # 2. Java 17
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 3. Instalacja Android SDK
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::Nie znaleziono Android SDK Manager."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      # 4. Automatyczne odnalezienie i rozpakowanie ZIP
+      - name: Extract AAAlko source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE=""
+
+          while IFS= read -r -d '' FILE; do
+            if unzip -Z1 "$FILE" 2>/dev/null | \
+              grep -Eq '(^|/)gradlew$'; then
+              ARCHIVE="$FILE"
+              break
+            fi
+          done < <(
+            find "$GITHUB_WORKSPACE" \
+              -type f \
+              -iname '*.zip' \
+              -not -path '*/.git/*' \
+              -not -path '*/.aaalko-source/*' \
+              -print0
+          )
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "::error::Nie znaleziono archiwum ZIP zawierającego gradlew."
+            echo "Pliki dostępne w repozytorium:"
+            find "$GITHUB_WORKSPACE" -maxdepth 4 -type f
+            exit 1
+          fi
+
+          echo "Znaleziono archiwum: $ARCHIVE"
+
+          DEST="$GITHUB_WORKSPACE/.aaalko-source"
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+
+          # Bezpieczne rozpakowanie archiwum
+          python3 - "$ARCHIVE" "$DEST" <<'PY'
+          import sys
+          import stat
+          import zipfile
+          import shutil
+          from pathlib import Path, PurePosixPath
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  name = item.filename.replace("\\", "/")
+                  relative = PurePosixPath(name)
+
+                  if relative.is_absolute() or ".." in relative.parts:
+                      raise SystemExit(
+                          f"Niebezpieczna ścieżka w ZIP: {name}"
+                      )
+
+                  if stat.S_ISLNK(item.external_attr >> 16):
+                      raise SystemExit(
+                          f"Archiwum zawiera niedozwolony link: {name}"
+                      )
+
+                  target = (destination / Path(*relative.parts)).resolve()
+
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(
+                          f"Plik wychodzi poza katalog projektu: {name}"
+                      )
+
+                  if item.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+
+                  target.parent.mkdir(parents=True, exist_ok=True)
+
+                  with z.open(item) as source, target.open("wb") as output:
+                      shutil.copyfileobj(source, output)
+
+          print("Archiwum poprawnie rozpakowane.")
+          PY
+
+          # Znajdź właściwy katalog projektu
+          WRAPPER="$(find "$DEST" -type f -name gradlew -print -quit)"
+
+          if [ -z "$WRAPPER" ]; then
+            echo "::error::ZIP nie zawiera pliku gradlew."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$WRAPPER")"
+
+          if [ ! -f "$PROJECT_DIR/settings.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+            echo "::error::Brakuje settings.gradle."
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ] || \
+             [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.properties" ]; then
+            echo "::error::Brakuje plików Gradle Wrapper."
+            exit 1
+          fi
+
+          chmod +x "$WRAPPER"
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Projekt AAAlko gotowy."
+          echo "Katalog: $PROJECT_DIR"
+
+      # 5. Konfiguracja Gradle po rozpakowaniu projektu
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # 6. Kompilacja aplikacji
+      - name: Build AAAlko APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assembleDebug
+
+      # 7. Sprawdzenie i przygotowanie APK
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$(find "$PROJECT_DIR" \
+            -type f \
+            -path '*/build/outputs/apk/debug/*.apk' \
+            -print -quit)"
+
+          if [ -z "$APK" ]; then
+            echo "::error::Nie znaleziono wygenerowanego APK."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          cp "$APK" "$GITHUB_WORKSPACE/output/AAAlko.apk"
+
+          echo "APK poprawnie wygenerowane."
+          ls -lh "$GITHUB_WORKSPACE/output/AAAlko.apk"
+
+      # 8. Udostępnienie gotowej aplikacji
+      - name: Upload AAAlko APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: AAAlko-APK
+          path: output/AAAlko.apk
+          if-no-files-found: error
+          retention-days: 14
+          
